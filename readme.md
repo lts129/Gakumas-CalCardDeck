@@ -37,7 +37,7 @@
 最终生成的表格中，工作表1是全部组合得分的详细结果；工作表2是结合不同配队的最优卡组
 
 工作表3和工作表4则是用来判断以当前卡组如果兑换一张常驻卡升5级上限能否给卡组带来提升
-![img.png](img.png)
-![img_1.png](img_1.png)
-![img_2.png](img_2.png)
-![img_3.png](img_3.png)
+![img.png](Fig/img.png)
+![img_1.png](Fig/img_1.png)
+![img_2.png](Fig/img_2.png)
+![img_3.png](Fig/img_3.png)
