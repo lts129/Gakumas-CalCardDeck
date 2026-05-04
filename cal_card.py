@@ -1,14 +1,38 @@
 import os
 from make_card import load_calculation_rules, calculate_card_stats, process_all_cards
 import pandas as pd
-from itertools import permutations
 from dataclasses import dataclass
-import logging
+import copy
+
+
+# 百分比方案定义：每个方案对应 (第一属性触发次数, 第二属性触发次数, 第三属性触发次数)
+# 用于替换"百分比"词条的触发次数
+PERCENTAGE_OPTIONS = {
+    'A': (10.65, 7.45, 3.95),
+    'B': (11.4, 6.75, 3.95),
+    'C': (9.5, 8.6, 3.95),
+}
+
+# ===== 可调参数：固定加值（一属性/二属性/三属性） =====
+ATTR_FIXED_BONUS = {1: 200, 2: 280, 3: 905}
+
+# ===== 可调参数：一属性额外比率（×百分比次数） =====
+ATTR1_EXTRA_RATIO = 11.2
+
+# ===== 可调参数：每个属性每百分比次数加值 =====
+PCT_PER_TRIGGER_BONUS = 100
+
+# ===== 可调参数：单颜色分数上限 =====
+COLOR_SCORE_CAP = 2800
+
+# ===== 可调参数：基础SP率 [一属性, 二属性, 三属性] =====
+BASE_SP_RATES = [0.25, 0.25, 0.25]
 
 
 @dataclass
 class CardSelectionConfig:
     """卡牌选择配置类"""
+
     color: str
     total: int
     sp_min: int
@@ -53,90 +77,32 @@ class OptimizationConfig:
             self.color_order.append(c)
             self.color_constraints[c] = CardSelectionConfig(c, total, sp_min)
             
-        if sum(cfg.total for cfg in self.color_constraints.values()) != 6:
-            print(f"警告：卡牌总数 ({sum(cfg.total for cfg in self.color_constraints.values())}) 不等于 6。")
-            
-        # 初始化日志
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-        self.logger = logging.getLogger(__name__)
-        # self.logger.info("优化配置初始化完成")
         
     def get_base_paths(self):
         """获取基础文件路径"""
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        # print(base_dir)
-        # self.logger.info(f"基础目录: {base_dir}")
         base_dir='./'
         return {
             'card': os.path.join(base_dir, '卡牌数据.xlsx'),
             'term': os.path.join(base_dir, '基础词条.xlsx'),
-            'rule': os.path.join(base_dir, '实际计算.xlsx')
+            'rule': os.path.join(base_dir, '实际计算.xlsx'),
+            'character': os.path.join(base_dir, '角色属性.xlsx')
         }
 
-def run_optimization(*args, **kwargs):
+
+def _optimize_with_cached_data(config, cached_cards, cached_rules):
     """
-    新入口函数 - 支持多种参数传递方式
-    用法示例:
-    1. run_optimization("红", 3, 1, "蓝", 2, 1, "黄", 1, 0, "理性", 1, 0)
-    2. run_optimization("红", 3, 1, "蓝", 2, 1, "黄", 1, 0, "理性", 1, 0, resident_upgrade=True)
-    3. config = {
-        'colors': [
-            {'color': '红', 'total': 3, 'sp_min': 1},
-            {'color': '蓝', 'total': 2, 'sp_min': 1},
-            {'color': '黄', 'total': 1, 'sp_min': 0}
-        ],
-        'target_type': '理性',
-        'mode': 1,
-        'rulemode': 0,
-        'resident_upgrade': False
-    }
+    使用已缓存的卡牌数据和规则进行优化计算。
+    避免重复加载Excel和重复计算卡牌分数。
+    
+    返回: (team_current, score_current), (team_max, score_max), color_scores_current, color_scores_max
+    color_scores 格式: {'红': 分数, '蓝': 分数, '黄': 分数}
     """
     try:
-        # 提取 resident_upgrade 参数
-        resident_upgrade = kwargs.get('resident_upgrade', False)
+        # 1. 使用已计算好分数的卡牌数据
+        cards = cached_cards
         
-        # 处理参数 - 支持两种调用方式
-        if len(args) >= 4 and all(isinstance(x, (str, int)) for x in args):
-            # 方式1: 直接传参 ("红", 3, 1, "蓝", 2, 1, "黄", 1, 0, "理性", 1, 0)
-            config = OptimizationConfig(*args)
-        elif len(args) >= 1 and isinstance(args[0], dict) and 'colors' in args[0]:
-            # 方式2: 传配置字典
-            config_data = args[0]
-            config = OptimizationConfig(
-                *[item for color_cfg in config_data['colors'] 
-                  for item in (color_cfg['color'], color_cfg['total'], color_cfg['sp_min'])],
-                config_data['target_type'],
-                config_data['mode'],
-                config_data['rulemode']
-            )
-            # 从字典中获取 resident_upgrade
-            resident_upgrade = config_data.get('resident_upgrade', False)
-        else:
-            raise ValueError("参数格式错误。请使用以下格式之一:\n"
-                           "1. run_optimization(\"红\", 3, 1, \"蓝\", 2, 1, \"黄\", 1, 0, \"理性\", 1, 0)\n"
-                           "2. run_optimization({'colors': [{'color': '红', 'total': 3, 'sp_min': 1}, ...], "
-                           "'target_type': '理性', 'mode': 1, 'rulemode': 0, 'resident_upgrade': False})")
-        
-        # 获取基础路径
-        paths = config.get_base_paths()
-        # 1. 加载基础数据（常驻升级模式的逻辑已在 process_cards 中处理）
-        cards = process_all_cards(paths['card'], paths['term'], resident_upgrade)
-        if not cards:
-            print("错误：未能加载卡牌数据。")
-            return
-
-        rules_db = load_calculation_rules(paths['rule'], config.rulemode)
-        if not rules_db:
-            print("警告：未能加载计算规则。")
-            # 即使没有规则，也继续执行，使用默认计算方式
-            
-        # 2. 计算所有卡牌的9种数值
-        cards = calculate_card_stats(cards, rules_db, config.mode)
-        if not cards:
-            print("错误：未能计算卡牌属性。")
-            return
-            
-        # 3. 预处理：过滤类型，计算有效分数，标记属性和SP状态
+        # 2. 预处理：过滤类型，计算有效分数，标记属性和SP状态
         valid_types = {config.target_type, '通用'}
         # 颜色 -> 属性索引映射
         color_to_attr = {c: idx + 1 for idx, c in enumerate(config.color_order)}
@@ -161,6 +127,8 @@ def run_optimization(*args, **kwargs):
             card.effective_current_score = getattr(card, curr_attr, 0.0)
             card.effective_max_score = getattr(card, max_attr, 0.0)
             card.effective_limit_score = getattr(card, lim_attr, 0.0)
+
+
             card.matched_color = c
             card.matched_attr_idx = attr_idx
 
@@ -174,30 +142,56 @@ def run_optimization(*args, **kwargs):
             else:
                 filtered_grouped[c]['non_sp'].append(card)
 
-        # 4. 执行优化
+        # 3. 执行优化
         prepared_data = prepare_candidate_pools(filtered_grouped, config)
         if not prepared_data:
-            # config.logger.error("未能生成候选池。")
             print("错误：未能生成候选池。")
             return
 
-        # 5. 计算最佳队伍
-        best_team_current, best_score_current = select_best_team_sp_constrained(
+        # 4. 计算最佳队伍（现在返回 team, score, team_card_scores）
+        best_team_current, best_score_current, team_scores_current = select_best_team_sp_constrained(
             prepared_data, config, 'current'
         )
-        best_team_max, best_score_max = select_best_team_sp_constrained(
+        best_team_max, best_score_max, team_scores_max = select_best_team_sp_constrained(
             prepared_data, config, 'max'
         )
 
+        # 5. 计算各颜色分数（使用与总分一致的每张卡实际分数）
+        color_scores_current = _calc_color_scores_from_team_scores(best_team_current, team_scores_current)
+        color_scores_max = _calc_color_scores_from_team_scores(best_team_max, team_scores_max)
+
         # 6. 输出结果
-        return (best_team_current, best_score_current), (best_team_max, best_score_max)
+        return (best_team_current, best_score_current), (best_team_max, best_score_max), color_scores_current, color_scores_max
     except Exception as e:
         print(f"优化过程中出现错误: {str(e)}")
         raise
 
+
+def _calc_color_scores_from_team_scores(team, team_scores):
+    """
+    根据队伍和每张卡在总分中实际使用的分数，计算各颜色得分。
+    确保 红分数+蓝分数+黄分数 = 总分。
+    
+    参数:
+        team: 卡牌列表（6张）
+        team_scores: 每张卡在总分中实际使用的分数列表（6个值）
+    
+    返回: {'红': 分数, '蓝': 分数, '黄': 分数}
+    """
+    color_scores = {'红': 0.0, '蓝': 0.0, '黄': 0.0}
+    
+    for card, score in zip(team, team_scores):
+        c = card.matched_color
+        if c in color_scores:
+            color_scores[c] += score
+    
+    return color_scores
+
+
 def prepare_candidate_pools(grouped_cards, config):
     """
     准备候选池并预排序
+
     返回: {
         color: {
             'total': int, 
@@ -261,12 +255,16 @@ def select_best_team_sp_constrained(grouped_cards, config, mode='current'):
        - 如果极限位是SP卡：需从剩余SP卡中补足 N_sp-1 个，从剩余所有卡中补足 N_rest 个。
        - 如果极限位是非SP卡：需从剩余SP卡中补足 N_sp 个，从剩余所有卡中补足 N_rest-1 个。
        - 关键：SP名额必须由SP卡填充，不可混用。
+    
+    返回: (best_team, best_score, team_card_scores)
+          team_card_scores: 每张卡在总分计算中实际使用的分数列表（与team顺序一致）
     """
     score_attr = 'effective_current_score' if mode == 'current' else 'effective_max_score'
     limit_attr = 'effective_limit_score'
 
     best_score = -1.0
     best_team = []
+    best_team_scores = []
 
     # 收集所有可能的极限卡候选 (每个颜色的 SP前N+2 和 非SP前N+2)
     all_limit_candidates = []
@@ -366,65 +364,268 @@ def select_best_team_sp_constrained(grouped_cards, config, mode='current'):
         if len(current_team) != 6:
             continue
 
+        # 记录每张卡在总分中实际使用的分数
+        # 极限卡用 limit_attr，其余卡用 score_attr
+        team_scores = []
         s_limit = getattr(limit_card, limit_attr, 0)
-        s_mode = sum(getattr(c, score_attr, 0) for c in current_team[1:])
-        total = s_limit + s_mode
+        team_scores.append(s_limit)
+        for c in current_team[1:]:
+            team_scores.append(getattr(c, score_attr, 0))
+        total = sum(team_scores)
 
         if total > best_score:
             best_score = total
             best_team = current_team
+            best_team_scores = team_scores
 
-    return best_team, best_score
+    return best_team, best_score, best_team_scores
 
-def _run_with_best_rulemode(base_args, resident_upgrade=False):
+
+def _modify_rules_db(base_rules, pct_triggers):
     """
-    对同一组参数分别用 rulemode=0 和 rulemode=1 计算，取总分最高的结果。
-    返回: (best_team_current, best_score_current), (best_team_max, best_score_max), best_rulemode
+    复制一份规则数据库，只修改"百分比"词条的触发次数。
+    其他词条的触发次数保持不变。
+    
+    参数:
+        base_rules: 从Excel加载的原始规则数据库
+        pct_triggers: (attr1, attr2, attr3) 三元组，用于替换"百分比"词条
+    
+    返回: 修改后的规则数据库副本
     """
-    best_result = None
-    best_rulemode = 0
-    best_total_score = -1.0
+    modified = copy.deepcopy(base_rules)
+    if '百分比' in modified:
+        modified['百分比'] = {
+            'attr1': float(pct_triggers[0]),
+            'attr2': float(pct_triggers[1]),
+            'attr3': float(pct_triggers[2]),
+        }
+    return modified
 
+
+def _run_all_rulemode_and_pct_cached(base_args, cached_data_pool, resident_upgrade=False):
+    """
+    使用缓存的卡牌数据，对同一组参数分别用 rulemode=0/1 和 3种百分比方案计算。
+    返回所有6种组合的结果（不选最佳），供外部根据上限限制后的总分进行选择。
+    
+    参数:
+        base_args: 基础参数元组 (c1, t1, sp1, c2, t2, sp2, c3, t3, sp3, target_type, mode, rulemode)
+        cached_data_pool: 预加载的缓存数据池
+        resident_upgrade: 是否启用常驻升级模式
+    
+    返回: list of dict, 每个dict包含:
+        {
+            'rulemode': int,
+            'pct_key': str,
+            'team_now': list, 'score_now': float,
+            'team_max': list, 'score_max': float,
+            'color_scores_now': dict, 'color_scores_max': dict,
+        }
+    """
+    results = []
+    
     for rulemode in [0, 1]:
-        # 替换 args 中的 rulemode 参数（倒数第1个）
         args_list = list(base_args)
-        args_list[-1] = rulemode  # rulemode 是最后一个参数
+        args_list[-1] = rulemode
         args = tuple(args_list)
 
-        try:
-            result_now, result_max = run_optimization(*args, resident_upgrade=resident_upgrade)
-            team_now, score_now = result_now
-            team_max, score_max = result_max
-            # 用最大模式总分作为比较基准
-            if score_max > best_total_score:
-                best_total_score = score_max
-                best_result = (result_now, result_max)
-                best_rulemode = rulemode
-        except Exception:
+        for pct_key in ['A', 'B', 'C']:
+            try:
+                cache_key = ('resident' if resident_upgrade else 'normal', rulemode, pct_key)
+                if cache_key not in cached_data_pool:
+                    continue
+                
+                cached_cards = cached_data_pool[cache_key]
+                config = OptimizationConfig(*args)
+                result_now, result_max, color_scores_now, color_scores_max = _optimize_with_cached_data(config, cached_cards, None)
+
+                team_now, score_now = result_now
+                team_max, score_max = result_max
+                
+                results.append({
+                    'rulemode': rulemode,
+                    'pct_key': pct_key,
+                    'team_now': team_now,
+                    'score_now': score_now,
+                    'team_max': team_max,
+                    'score_max': score_max,
+                    'color_scores_now': color_scores_now,
+                    'color_scores_max': color_scores_max,
+                })
+            except Exception:
+                continue
+
+    return results
+
+
+def _preload_cached_data(paths):
+    """
+    预加载所有需要的卡牌数据和规则，避免重复读取Excel。
+    
+    缓存结构为: {
+        ('normal', 0, 'A'): [已计算好分数的卡牌列表],
+        ('normal', 0, 'B'): [已计算好分数的卡牌列表],
+        ('normal', 0, 'C'): [已计算好分数的卡牌列表],
+        ('normal', 1, 'A'): [已计算好分数的卡牌列表],
+        ...
+        ('resident', 1, 'C'): [已计算好分数的卡牌列表],
+    }
+    共 2 (resident) × 2 (rulemode) × 3 (pct) = 12 组缓存
+    
+    注意：只有"百分比"词条的触发次数被替换，其他词条保持Excel中的原始值。
+    """
+    cached_pool = {}
+    
+    # 预加载词条数据库（只需要加载一次）
+    from make_card import load_keyword_database
+    term_db = load_keyword_database(paths['term'])
+    
+    for resident_upgrade in [False, True]:
+        resident_key = 'resident' if resident_upgrade else 'normal'
+        
+        # 加载卡牌原始数据（只需要加载一次 per resident_upgrade）
+        cards_raw = process_all_cards(paths['card'], paths['term'], resident_upgrade)
+        
+        for rulemode in [0, 1]:
+            # 从Excel加载原始规则
+            base_rules = load_calculation_rules(paths['rule'], rulemode)
+            
+            for pct_key, triggers in PERCENTAGE_OPTIONS.items():
+                # 复制规则，只修改"百分比"词条的触发次数
+                modified_rules = _modify_rules_db(base_rules, triggers)
+                
+                # 使用修改后的规则计算卡牌分数（mode=1 固定）
+                cards_scored = calculate_card_stats(copy.deepcopy(cards_raw), modified_rules, 1)
+                
+                cache_key = (resident_key, rulemode, pct_key)
+                cached_pool[cache_key] = cards_scored
+
+
+    
+    return cached_pool
+
+
+def load_character_data(path):
+    """
+    从角色属性.xlsx加载角色数据。
+    
+    返回: DataFrame，包含列：角色, 状态, 一属性, 二属性, 三属性,
+          一属性数值, 二属性数值, 三属性数值, 一属性比率, 二属性比率, 三属性比率
+    """
+    if not os.path.exists(path):
+        print(f"错误：找不到文件 '{path}'")
+        return None
+    
+    try:
+        df = pd.read_excel(path, sheet_name='Sheet1')
+        required_cols = ['角色', '状态', '一属性', '二属性', '三属性']
+        for col in required_cols:
+            if col not in df.columns:
+                print(f"错误：角色属性表缺少列 '{col}'")
+                return None
+        return df
+    except Exception as e:
+        print(f"读取角色属性表时发生错误: {e}")
+        return None
+
+
+def _calc_extra(pct_t1, pct_t2, pct_t3, attr1_val, attr2_val, attr3_val,
+                attr1_ratio, attr2_ratio, attr3_ratio, color_to_attr_idx):
+    """
+    计算给定百分比方案的额外加值。
+    使用全局变量 ATTR_FIXED_BONUS, ATTR1_EXTRA_RATIO, PCT_PER_TRIGGER_BONUS。
+    
+    返回: (extra_by_color, total_extra)
+    """
+    attr_data = {
+        1: {'val': attr1_val, 'ratio': attr1_ratio, 'pct': pct_t1},
+        2: {'val': attr2_val, 'ratio': attr2_ratio, 'pct': pct_t2},
+        3: {'val': attr3_val, 'ratio': attr3_ratio, 'pct': pct_t3},
+    }
+    extra_by_color = {'红': 0.0, '蓝': 0.0, '黄': 0.0}
+    for color, attr_idx in color_to_attr_idx.items():
+        d = attr_data[attr_idx]
+        extra = 0.0
+        extra += d['val']  # 1. 属性数值
+        extra += d['ratio'] * d['pct']  # 2. 比率 × 百分比次数
+        extra += ATTR_FIXED_BONUS[attr_idx]  # 3. 固定加值（一/二/三属性）
+        if attr_idx == 1:
+            extra += ATTR1_EXTRA_RATIO * pct_t1  # 4. 一属性额外比率×百分比次数
+        extra += PCT_PER_TRIGGER_BONUS * d['pct']  # 5. 每个属性+100×百分比次数
+        extra_by_color[color] = extra
+    return extra_by_color, sum(extra_by_color.values())
+
+
+def _apply_cap(color_scores, extra_by_color):
+    """
+    应用单颜色分数上限（使用全局变量 COLOR_SCORE_CAP）。
+    
+    返回: (capped_scores, capped_total)
+    """
+    capped = {}
+    for c in ['红', '蓝', '黄']:
+        capped[c] = min(color_scores.get(c, 0) + extra_by_color.get(c, 0), COLOR_SCORE_CAP)
+    return capped, sum(capped.values())
+
+
+def _calc_sp_rate(team, mode, c1_color, c2_color):
+    """
+    计算一属性和二属性的SP率。
+    使用全局变量 BASE_SP_RATES。
+    team: 6张卡牌列表（第1张是极限位）
+    mode: 'current' 或 'max'
+    c1_color, c2_color: 一属性颜色, 二属性颜色
+    返回: (一属性SP率, 二属性SP率)
+    """
+    sp_rates = {c1_color: 0.0, c2_color: 0.0}
+    
+    for i, card in enumerate(team):
+        if card.kw2_name != 'SP率':
             continue
+        if card.kw2_stats is None or card.kw2_stats[0] is None:
+            continue
+        
+        color = card.matched_color
+        if color not in sp_rates:
+            continue
+        
+        if i == 0:  # 极限位卡使用极限等级值
+            sp_val = card.kw2_stats[2]
+        elif mode == 'current':
+            sp_val = card.kw2_stats[0]  # 当前等级值
+        else:
+            sp_val = card.kw2_stats[1]  # 最高等级值
+        
+        sp_rates[color] += sp_val
+    
+    # 总SP率 = 基础SP率 + 额外SP率%
+    rate1 = BASE_SP_RATES[0] + sp_rates[c1_color] / 100.0
+    rate2 = BASE_SP_RATES[1] + sp_rates[c2_color] / 100.0
+    
+    return rate1, rate2
 
-    if best_result is None:
-        # 如果都失败，用 rulemode=0 再试一次
-        args_list = list(base_args)
-        args_list[-1] = 0
-        result_now, result_max = run_optimization(*tuple(args_list), resident_upgrade=resident_upgrade)
-        best_result = (result_now, result_max)
-        best_rulemode = 0
 
-    return best_result[0], best_result[1], best_rulemode
+def _calc_success_rate(pct_key, rate1, rate2):
+    """
+    根据百分比方案计算成功率。
+    A: 一属性^4 × 二属性^1
+    B: 一属性^4 × 二属性^1
+    C: 一属性^3 × 二属性^2
+    """
+    if pct_key in ('A', 'B'):
+        return (rate1 ** 4) * rate2
+    else:  # 'C'
+        return (rate1 ** 3) * (rate2 ** 2)
 
 
 def run_batch_analysis():
     """
-    批量分析函数：遍历所有组合并生成包含6列卡牌名称的表格
+    批量分析函数：遍历所有角色+状态组合并生成包含6列卡牌名称的表格
     输出到Excel的3个工作表：
       Sheet 1: 所有组合的详细结果
       Sheet 2: 各模式最佳组合（常规模式、最大模式、常驻升级模式各一个）
       Sheet 3: 常驻升级价值总结（哪些常驻卡升级后提升了得分）
     """
-
     # 1. 定义所有可能的变量
-    colors = ['红', '蓝', '黄']
     types = ['理性', '感性', '非凡']
 
     # 配队模式定义
@@ -433,19 +634,48 @@ def run_batch_analysis():
         ("3/2/1", 3, 2, 2, 0, 1, 0),
         ("2/3/1", 2, 1, 3, 1, 1, 0),
         ("3/1/2", 3, 2, 1, 0, 2, 0),
-        ("4/2/0", 4, 2, 2, 0, 0, 0)
+        ("4/2/0", 4, 2, 2, 1, 0, 0),
+        ("4/1/1", 4, 2, 1, 1, 1, 0),
+        ("3/2/1", 3, 2, 2, 1, 1, 0),
+        ("2/3/1", 2, 2, 3, 1, 1, 0),
+        ("3/1/2", 3, 2, 1, 1, 2, 0),
+        ("4/2/0", 4, 2, 2, 1, 0, 0)
     ]
 
     results = []
+
     # 用于Sheet 3：记录每个组合中常驻升级带来的变化
     upgrade_impact_records = []
 
-    num=0
-    # 2. 生成所有颜色排列 (6种)
-    for color_perm in permutations(colors):
-        c1, c2, c3 = color_perm
-        print(f'正在进行{c1},{c2},{c3}组合的计算，进度{num}/6')
-        num=num+1
+    # --- 优化：预加载所有缓存数据 ---
+    print("正在预加载卡牌数据和计算规则...")
+    paths = OptimizationConfig('红', 1, 0, '蓝', 1, 0, '黄', 1, 0, '理性', 1, 0).get_base_paths()
+    cached_data_pool = _preload_cached_data(paths)
+    print("预加载完成，开始批量计算...")
+
+    # 加载角色属性数据
+    char_df = load_character_data(paths['character'])
+    if char_df is None or char_df.empty:
+        print("错误：未能加载角色属性数据。")
+        return None
+
+    print(f"已加载 {len(char_df)} 个角色状态组合。")
+
+    # 2. 遍历所有角色+状态组合
+    for _, char_row in char_df.iterrows():
+        character = char_row['角色']
+        state = char_row['状态']
+        c1 = char_row['一属性']
+        c2 = char_row['二属性']
+        c3 = char_row['三属性']
+        
+        # 读取角色属性数值和比率
+        attr1_val = float(char_row.get('一属性数值', 0))
+        attr2_val = float(char_row.get('二属性数值', 0))
+        attr3_val = float(char_row.get('三属性数值', 0))
+        attr1_ratio = float(char_row.get('一属性比率', 0))
+        attr2_ratio = float(char_row.get('二属性比率', 0))
+        attr3_ratio = float(char_row.get('三属性比率', 0))
 
         for team_name, t1, sp1, t2, sp2, t3, sp3 in team_configs:
             for target_type in types:
@@ -454,27 +684,62 @@ def run_batch_analysis():
                 # 0,0表示纯数值，1,0表示计算道具,2,0表示加上等价数值
 
                 try:
-                    # 使用新入口函数（自动尝试 rulemode=0 和 1，取最大值）
-                    (team_now_cards, score_now), (team_max_cards, score_max), rulemode_used = \
-                        _run_with_best_rulemode(base_args, resident_upgrade=False)
+                    # 颜色 -> 属性索引映射（用于额外加值计算）
+                    color_to_attr_idx = {c1: 1, c2: 2, c3: 3}
 
+                    # --- 常规模式/最大模式：遍历所有6种组合，用上限限制后的总分选最佳 ---
+                    all_results_normal = _run_all_rulemode_and_pct_cached(base_args, cached_data_pool, resident_upgrade=False)
+                    
+                    best_normal = None
+                    best_normal_capped_total = -1.0
+                    for r in all_results_normal:
+                        pct_triggers = PERCENTAGE_OPTIONS[r['pct_key']]
+                        extra_by_color, _ = _calc_extra(*pct_triggers, attr1_val, attr2_val, attr3_val,
+                                                        attr1_ratio, attr2_ratio, attr3_ratio, color_to_attr_idx)
+                        # 用最大模式分数选最佳
+                        capped_scores, capped_total = _apply_cap(r['color_scores_max'], extra_by_color)
+                        if capped_total > best_normal_capped_total:
+                            best_normal_capped_total = capped_total
+                            best_normal = r
+                            best_normal_extra = extra_by_color
+
+                    if best_normal is None:
+                        raise Exception("所有组合均失败")
+
+                    rulemode_used = best_normal['rulemode']
+                    pct_key = best_normal['pct_key']
                     rulemode_str = str(rulemode_used)
+                    # 对常规模式和最大模式分别应用上限
+                    capped_now_scores, capped_now_total = _apply_cap(best_normal['color_scores_now'], best_normal_extra)
+                    capped_max_scores, capped_max_total = _apply_cap(best_normal['color_scores_max'], best_normal_extra)
 
-                    # --- 关键修改点：将6张卡拆分为6列 ---
+                    # --- 计算成功率 ---
+                    # 常规模式：使用当前等级值
+                    rate1_now, rate2_now = _calc_sp_rate(best_normal['team_now'], 'current', c1, c2)
+                    success_rate_now = _calc_success_rate(pct_key, rate1_now, rate2_now)
+                    # 最大模式：使用最高等级值
+                    rate1_max, rate2_max = _calc_sp_rate(best_normal['team_max'], 'max', c1, c2)
+                    success_rate_max = _calc_success_rate(pct_key, rate1_max, rate2_max)
+
+                    # --- 将6张卡拆分为6列 ---
                     # 常规模式行
-                    card_names_now = [card.name for card in team_now_cards]
-                    # 确保正好有6张
+                    card_names_now = [card.name for card in best_normal['team_now']]
                     while len(card_names_now) < 6:
                         card_names_now.append("空位")
 
                     results.append({
-                        '颜色组合': f"{c1}{c2}{c3}",
+                        '角色': character,
+                        '状态': state,
                         '配队模式': team_name,
                         '类型': target_type,
                         '计算模式': '常规模式',
                         '规则': rulemode_str,
-                        '总分': round(score_now, 2),
-                        # --- 6张卡分列6列 ---
+                        '百分比方案': pct_key,
+                        '总分': round(capped_now_total, 2),
+                        '红分数': round(capped_now_scores['红'], 2),
+                        '蓝分数': round(capped_now_scores['蓝'], 2),
+                        '黄分数': round(capped_now_scores['黄'], 2),
+                        '成功率': f"{success_rate_now * 100:.2f}%",
                         '卡1': card_names_now[0],
                         '卡2': card_names_now[1],
                         '卡3': card_names_now[2],
@@ -484,18 +749,23 @@ def run_batch_analysis():
                     })
 
                     # 最大模式行
-                    card_names_max = [card.name for card in team_max_cards]
+                    card_names_max = [card.name for card in best_normal['team_max']]
                     while len(card_names_max) < 6:
                         card_names_max.append("空位")
 
                     results.append({
-                        '颜色组合': f"{c1}{c2}{c3}",
+                        '角色': character,
+                        '状态': state,
                         '配队模式': team_name,
                         '类型': target_type,
                         '计算模式': '最大模式',
                         '规则': rulemode_str,
-                        '总分': round(score_max, 2),
-                        # --- 6张卡分列6列 ---
+                        '百分比方案': pct_key,
+                        '总分': round(capped_max_total, 2),
+                        '红分数': round(capped_max_scores['红'], 2),
+                        '蓝分数': round(capped_max_scores['蓝'], 2),
+                        '黄分数': round(capped_max_scores['黄'], 2),
+                        '成功率': f"{success_rate_max * 100:.2f}%",
                         '卡1': card_names_max[0],
                         '卡2': card_names_max[1],
                         '卡3': card_names_max[2],
@@ -504,22 +774,53 @@ def run_batch_analysis():
                         '卡6': card_names_max[5]
                     })
 
-                    # 常驻升级模式行（使用最大模式的计算方式，因为改变的只有最大等级）
-                    (_, _), (team_resident_cards, score_resident), resident_rulemode = \
-                        _run_with_best_rulemode(base_args, resident_upgrade=True)
+
+                    # --- 常驻升级模式：同样遍历所有6种组合，用上限限制后的总分选最佳 ---
+                    all_results_resident = _run_all_rulemode_and_pct_cached(base_args, cached_data_pool, resident_upgrade=True)
+                    
+                    best_resident = None
+                    best_resident_capped_total = -1.0
+                    for r in all_results_resident:
+                        pct_triggers = PERCENTAGE_OPTIONS[r['pct_key']]
+                        extra_by_color, _ = _calc_extra(*pct_triggers, attr1_val, attr2_val, attr3_val,
+                                                        attr1_ratio, attr2_ratio, attr3_ratio, color_to_attr_idx)
+                        capped_scores, capped_total = _apply_cap(r['color_scores_max'], extra_by_color)
+
+                        if capped_total > best_resident_capped_total:
+                            best_resident_capped_total = capped_total
+                            best_resident = r
+                            best_resident_extra = extra_by_color
+                    
+                    if best_resident is None:
+                        raise Exception("常驻升级所有组合均失败")
+                    
+                    resident_rulemode = best_resident['rulemode']
+                    resident_pct_key = best_resident['pct_key']
                     resident_rulemode_str = str(resident_rulemode)
-                    card_names_resident = [card.name for card in team_resident_cards]
+                    
+                    capped_resident_scores, capped_resident_total = _apply_cap(best_resident['color_scores_max'], best_resident_extra)
+
+                    # 常驻升级模式：使用最高等级值（与最大模式相同）
+                    rate1_resident, rate2_resident = _calc_sp_rate(best_resident['team_max'], 'max', c1, c2)
+                    success_rate_resident = _calc_success_rate(resident_pct_key, rate1_resident, rate2_resident)
+
+                    card_names_resident = [card.name for card in best_resident['team_max']]
                     while len(card_names_resident) < 6:
                         card_names_resident.append("空位")
 
                     results.append({
-                        '颜色组合': f"{c1}{c2}{c3}",
+                        '角色': character,
+                        '状态': state,
                         '配队模式': team_name,
                         '类型': target_type,
                         '计算模式': '常驻升级模式',
                         '规则': resident_rulemode_str,
-                        '总分': round(score_resident, 2),
-                        # --- 6张卡分列6列 ---
+                        '百分比方案': resident_pct_key,
+                        '总分': round(capped_resident_total, 2),
+                        '红分数': round(capped_resident_scores['红'], 2),
+                        '蓝分数': round(capped_resident_scores['蓝'], 2),
+                        '黄分数': round(capped_resident_scores['黄'], 2),
+                        '成功率': f"{success_rate_resident * 100:.2f}%",
                         '卡1': card_names_resident[0],
                         '卡2': card_names_resident[1],
                         '卡3': card_names_resident[2],
@@ -528,47 +829,84 @@ def run_batch_analysis():
                         '卡6': card_names_resident[5]
                     })
 
+
                     # --- 分析常驻升级影响 ---
-                    # 比较最大模式 vs 常驻升级模式的队伍和得分
-                    if score_resident > score_max:
+                    # 比较最大模式 vs 常驻升级模式的队伍和得分（使用上限限制后的分数）
+                    # 重要：必须使用相同的 rulemode/pct_key 进行比较，否则分数差异可能来自规则不同而非升级
+                    if capped_resident_total > capped_max_total:
                         # 找出哪些常驻卡在常驻升级模式中提升了得分
-                        # 构建最大模式队伍中常驻卡的得分映射
                         max_team_resident_scores = {}
-                        for card in team_max_cards:
+                        for card in best_normal['team_max']:
                             if card.resident_category == '常驻':
                                 max_team_resident_scores[card.name] = card.effective_max_score
 
-                        # 构建常驻升级模式队伍中常驻卡的得分映射
                         resident_team_resident_scores = {}
-                        for card in team_resident_cards:
+                        for card in best_resident['team_max']:
                             if card.resident_category == '常驻':
                                 resident_team_resident_scores[card.name] = card.effective_max_score
 
-                        # 找出得分提升的常驻卡
-                        all_resident_names = set(max_team_resident_scores.keys()) | set(resident_team_resident_scores.keys())
-                        for rname in all_resident_names:
-                            old_score = max_team_resident_scores.get(rname, 0)
-                            new_score = resident_team_resident_scores.get(rname, 0)
-                            if new_score > old_score:
+                        # 只比较同时出现在两个队伍中的常驻卡
+                        # 如果一张卡只出现在其中一个队伍，说明是队伍构成变化而非升级影响
+                        common_resident_names = set(max_team_resident_scores.keys()) & set(resident_team_resident_scores.keys())
+                        for rname in common_resident_names:
+                            old_score = max_team_resident_scores[rname]
+                            new_score = resident_team_resident_scores[rname]
+                            
+                            # 关键修复：如果 normal 和 resident 使用了不同的 rulemode/pct_key，
+                            # 则卡牌分数差异可能来自规则不同而非升级。
+                            # 此时需要检查卡牌的基础词条属性是否真的发生了变化。
+                            # 如果 max_level 相同且 kw_stats 相同，则分数差异来自规则不同，不应视为升级。
+                            normal_card = None
+                            resident_card = None
+                            for c in best_normal['team_max']:
+                                if c.name == rname:
+                                    normal_card = c
+                                    break
+                            for c in best_resident['team_max']:
+                                if c.name == rname:
+                                    resident_card = c
+                                    break
+                            
+                            # 检查卡牌是否真的被升级了（max_level 或 kw_stats 发生变化）
+                            really_upgraded = False
+                            if normal_card and resident_card:
+                                # 检查 max_level 是否不同
+                                if normal_card.max_level != resident_card.max_level:
+                                    really_upgraded = True
+                                else:
+                                    # 检查 kw_stats 是否不同
+                                    for kw_attr in ['kw1_stats', 'kw2_stats', 'kw4_stats', 'kw5_stats', 'kw6_stats']:
+                                        old_stats = getattr(normal_card, kw_attr, None)
+                                        new_stats = getattr(resident_card, kw_attr, None)
+                                        if old_stats != new_stats:
+                                            really_upgraded = True
+                                            break
+                            
+                            if really_upgraded and new_score > old_score:
                                 upgrade_impact_records.append({
-                                    '颜色组合': f"{c1}{c2}{c3}",
+                                    '角色': character,
+                                    '状态': state,
                                     '配队模式': team_name,
                                     '类型': target_type,
                                     '常驻卡名称': rname,
                                     '升级前得分': round(old_score, 2),
                                     '升级后得分': round(new_score, 2),
                                     '得分提升': round(new_score - old_score, 2),
-                                    '队伍总分提升': round(score_resident - score_max, 2)
+                                    '队伍总分提升': round(capped_resident_total - capped_max_total, 2)
                                 })
+
 
                 except Exception as e:
                     results.append({
-                        '颜色组合': f"{c1}{c2}{c3}",
+                        '角色': character,
+                        '状态': state,
                         '配队模式': team_name,
                         '类型': target_type,
                         '计算模式': 'Error',
                         '规则': '',
+                        '百分比方案': '',
                         '总分': 'N/A',
+                        '红分数': '', '蓝分数': '', '黄分数': '',
                         '卡1': str(e), '卡2': '', '卡3': '', '卡4': '', '卡5': '', '卡6': ''
                     })
 
@@ -576,23 +914,26 @@ def run_batch_analysis():
     if results:
         df_all = pd.DataFrame(results)
 
-        # 重新排列列顺序，让卡牌列紧挨着分数
-        column_order = ['颜色组合', '配队模式', '类型', '计算模式', '规则', '总分',
+        # 重新排列列顺序
+        column_order = ['角色', '状态', '配队模式', '类型', '计算模式', '规则', '百分比方案', '总分',
+                        '红分数', '蓝分数', '黄分数', '成功率',
                         '卡1', '卡2', '卡3', '卡4', '卡5', '卡6']
+
         # 检查是否所有列都存在（防止报错）
         column_order = [col for col in column_order if col in df_all.columns]
         df_all = df_all[column_order]
 
         # --- Sheet 2: 各模式最佳组合 ---
-        # 对每个(颜色组合, 类型)组合，找出各模式总分最高的配队模式
+        # 对每个(角色, 状态, 类型)组合，找出各模式总分最高的配队模式
         best_combinations = []
-        # 获取所有唯一的(颜色组合, 类型)组合
-        unique_groups = df_all[['颜色组合', '类型']].drop_duplicates()
+        # 获取所有唯一的(角色, 状态, 类型)组合
+        unique_groups = df_all[['角色', '状态', '类型']].drop_duplicates()
         for _, group_row in unique_groups.iterrows():
-            color_combo = group_row['颜色组合']
+            character = group_row['角色']
+            state = group_row['状态']
             target_type = group_row['类型']
             # 筛选该组合的数据
-            group_df = df_all[(df_all['颜色组合'] == color_combo) & (df_all['类型'] == target_type)]
+            group_df = df_all[(df_all['角色'] == character) & (df_all['状态'] == state) & (df_all['类型'] == target_type)]
             for mode_name in ['常规模式', '最大模式', '常驻升级模式']:
                 mode_df = group_df[group_df['计算模式'] == mode_name]
                 if not mode_df.empty:
@@ -606,17 +947,19 @@ def run_batch_analysis():
         df_upgrade = pd.DataFrame(upgrade_impact_records) if upgrade_impact_records else pd.DataFrame()
 
         # 如果升级记录不为空，添加汇总：统计每张常驻卡在所有组合中出现的次数和总提升
+        # 所有得分均使用队伍总分提升计算
         if not df_upgrade.empty:
             summary_rows = []
             card_summary = df_upgrade.groupby('常驻卡名称').agg(
-                出现次数=('得分提升', 'count'),
-                总得分提升=('得分提升', 'sum'),
-                平均得分提升=('得分提升', 'mean')
+                出现次数=('队伍总分提升', 'count'),
+                总得分提升=('队伍总分提升', 'sum'),
+                平均得分提升=('队伍总分提升', 'mean')
             ).reset_index()
             # 按总得分提升降序排列
             card_summary = card_summary.sort_values('总得分提升', ascending=False)
             summary_rows = card_summary.to_dict('records')
             df_summary = pd.DataFrame(summary_rows)
+
         else:
             df_summary = pd.DataFrame()
 
@@ -651,4 +994,5 @@ if __name__ == "__main__":
 
     if result_df is not None:
         print(f"\n计算完成，共生成 {len(result_df)} 行数据。")
-    input("按回车键退出程序...")
+
+    I = input("按下回车键后退出")

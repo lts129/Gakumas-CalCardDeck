@@ -205,7 +205,7 @@ def process_cards(card_file, term_file, sheet_name='SSR', fixed_mode=1, resident
             max_lvl = 1
 
         # 常驻升级模式：常驻卡的最高等级+5
-        if resident_upgrade and card.resident_category == '常驻' and sheet_name=="SSR":
+        if resident_upgrade and card.resident_category == '常驻' and sheet_name=="SSR" and max_lvl<60:
             max_lvl += 5
             card.max_level = max_lvl  # 更新卡牌对象的max_level
 
